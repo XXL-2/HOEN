@@ -1,0 +1,278 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from torch.utils.data import TensorDataset
+import copy
+from collections import OrderedDict
+import assessment
+from torch.optim.lr_scheduler import LRScheduler
+'''相比与1，是手搓SWA模型平均方法'''
+import time
+start = time.perf_counter()
+torch.manual_seed(88)
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+# 设置日志记录
+import logging
+_logger = logging.getLogger(__name__)
+
+class CustomAveragedModel(nn.Module):
+    def __init__(self, model):
+        super(CustomAveragedModel, self).__init__()
+        self.module = copy.deepcopy(model)
+        self.n_averaged = 0
+
+    def forward(self, *inputs, **kwargs):
+        return self.module(*inputs, **kwargs)
+
+    def update_parameters(self, model):
+
+        self.n_averaged += 1
+        print(self.n_averaged)
+        for p_swa, p_model in zip(self.module.parameters(), model.parameters()):
+            print(p_model.data)
+
+            # print('xxxxxxxxxxxx')
+            if p_model.requires_grad:
+                # p_swa.data *= (self.n_averaged - 1) / self.n_averaged
+                # p_swa.data += p_model.data / self.n_averaged
+                if self.n_averaged == 1:
+                    p_swa.data = p_model.data.clone()
+                #     print(p_swa.data)
+                else:
+                    p_swa.data = p_swa.data*(self.n_averaged-1)
+                    p_swa.data += p_model.data
+                    p_swa.data = p_swa.data / self.n_averaged
+                    print('xxxxxxxxxxxxxxxxxx')
+                    # print(p_model.data)
+                    # print(p_swa.data)
+            # print(p_swa.data)
+'''数据提取'''
+data = pd.read_excel(r"C:\Users\11860\Desktop\论文1\数据\预测数据.xlsx", sheet_name="比利时")
+df = data[["AVGV","温度","工作日"]].values.astype('float32')  # 转换数据类型为float32  684
+
+look_back = 168
+
+# list1 = df[0: int(len(df)*0.6)]#(5256, 1)
+
+trainlist1 = df[0: int(len(df)*0.8)] #7008
+validlist1 = df[int(len(df)*0.8)-look_back:int(len(df)*0.9)]#1044
+testlist1 = df[int(len(df)*0.9)-look_back:]#1044
+
+scaler = MinMaxScaler(feature_range=(0, 1))
+train_scaled = scaler.fit_transform(trainlist1)
+valid_scaled = scaler.transform(validlist1)
+test_scaled = scaler.transform(testlist1)
+
+'''定义混合训练集处理函数'''
+def create_dataset(dataset, look_back):
+    dataX, dataY = [], []
+    for i in range(look_back,len(dataset)):
+        load_dataX = dataset[i - look_back: i, :]
+        load_dataY = dataset[i, 0]
+        dataX.append(load_dataX)
+        dataY.append(load_dataY)
+    return np.array(dataX), np.array(dataY)
+
+inputT, outputT = create_dataset(train_scaled, look_back)
+inputV, outputV = create_dataset(valid_scaled, look_back)  # torch.Size([37, 81]),torch.Size([37, 1])
+inputTEST, outputTEST = create_dataset(test_scaled, look_back)
+
+# 转换为PyTorch张量
+inputT = torch.tensor(inputT, dtype=torch.float32).to(device)
+outputT = torch.tensor(outputT, dtype=torch.float32).to(device)
+inputV = torch.tensor(inputV, dtype=torch.float32).to(device)
+outputV = torch.tensor(outputV, dtype=torch.float32).to(device)
+inputTEST = torch.tensor(inputTEST, dtype=torch.float32).to(device)
+outputTEST = torch.tensor(outputTEST, dtype=torch.float32).to(device)
+print(outputT.shape)
+print(outputV.shape)
+# outputT = scaler.inverse_transform(outputT.cpu().numpy())
+# outputV = scaler.inverse_transform(outputV.cpu().numpy())
+# outputTEST = scaler.inverse_transform(outputTEST.cpu().numpy())
+
+'''定义网络架构'''
+class GRUModel(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=2):
+        super(GRUModel, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True)
+        self.dropout = nn.Dropout(0.2)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
+        self.gru.flatten_parameters()  # 添加这一行来解决权重警告
+        out, _ = self.gru(x, h0)
+        out = self.dropout(out[:, -1, :])  # 取最后一个时间步的输出作为输入到全连接层
+        out = self.fc(out)
+        return out
+# 定义模型
+model = GRUModel(input_size=3, hidden_size=20, output_size=1)
+model.to(device)
+
+# 定义损失函数和优化器
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.004)
+
+num_epochs = 400
+annealing_epochs = 6
+swa_start = 382
+swa_lr = 0.0004
+
+# 自定义学习率调度器
+class CosineAnnealingRestartLR(LRScheduler):
+    def __init__(self, optimizer, T_max, eta_min, last_epoch=-1):
+        self.T_max = T_max
+        self.eta_min = eta_min
+        self.T_cur = T_max  # 当前周期的长度
+        super(CosineAnnealingRestartLR, self).__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < swa_start:
+            return [0.004 for _ in self.base_lrs]
+        else:
+            epoch_in_cycle = (self.last_epoch - swa_start) % self.T_max
+            epoch_ratio = torch.tensor(epoch_in_cycle / (self.T_max-1), dtype=torch.float32)
+            return [self.eta_min + (base_lr - self.eta_min) *
+                    (1 + torch.cos(torch.pi * epoch_ratio)) / 2
+                    for base_lr in self.base_lrs]
+
+# 创建学习率调度器
+scheduler = CosineAnnealingRestartLR(optimizer, T_max=annealing_epochs, eta_min=swa_lr)
+
+# 创建 SWA 模型
+swa_model = CustomAveragedModel(model)
+
+train_losses = []  # 用于存储每个epoch的训练损失值
+valid_losses = []  # 用于存储每个epoch的验证损失值
+swa_train_losses = []  # 用于存储每个epoch的验证损失值
+swa_valid_losses = []    # 用于存储每个epoch的验证损失值
+
+for epoch in range(num_epochs):
+    for param_group in optimizer.param_groups:
+        print(f'Epoch {epoch + 1} - Learning Rate: {param_group["lr"]}')
+    model.train()
+    optimizer.zero_grad()
+    outputs = model(inputT)
+    loss = criterion(outputs.squeeze(), outputT)
+    loss.backward()
+    optimizer.step()
+
+    # 记录训练损失
+    train_losses.append(loss.item())
+
+    # 更新学习率
+    scheduler.step()
+
+    # 检查是否到达了退火周期的末尾
+    if epoch >= swa_start and (epoch - swa_start + 1) % annealing_epochs == 0:
+        for param_group in optimizer.param_groups:
+             print(f'Epoch {epoch + 2} - Learning Rate: {param_group["lr"]}')
+        swa_model.update_parameters(model)
+    # 计算SWA模型的训练损失
+    with torch.no_grad():
+        swa_model.eval()
+        swa_train_outputs = swa_model(inputT)
+        swa_train_loss = criterion(swa_train_outputs.squeeze(), outputT).item()
+        swa_train_losses.append(swa_train_loss)
+
+        swa_valid_outputs = swa_model(inputV)
+        swa_valid_loss = criterion(swa_valid_outputs.squeeze(), outputV).item()
+        swa_valid_losses.append(swa_valid_loss)
+
+    # 验证损失计算
+    model.eval()
+    with torch.no_grad():
+        valid_outputs = model(inputV)
+        valid_loss = criterion(valid_outputs.squeeze(), outputV).item()
+        valid_losses.append(valid_loss)
+
+    if (epoch + 1) % 10 == 0:
+        print(f'Epoch [{epoch + 1}/{num_epochs}], '
+              f'Training Loss: {loss * 10000:.4f}*10^-4, '
+              f'Validation Loss: {valid_loss * 10000:.4f}*10^-4, '
+              f'swa_Validation Loss: {swa_train_loss * 10000:.4f}*10^-4, '
+              f'swa_Validation Loss: {swa_valid_loss * 10000:.4f}*10^-4, ')
+
+print("---------模型训练完成，接下来开始预测---------")
+
+'''预测'''
+with torch.no_grad():
+    swa_model.eval()
+    pre_train = swa_model(inputT).cpu().numpy()
+    pre_valid = swa_model(inputV).cpu().numpy()
+    pre_test = swa_model(inputTEST).cpu().numpy()
+
+# 反归一化并评估
+def trans(a,origin_ndim):
+    if isinstance(a, torch.Tensor) and a.is_cuda:
+        a = a.detach().cpu().reshape(-1, 1).numpy()  # 将CUDA张量移动到CPU上并转换为NumPy数组
+    if isinstance(a, np.ndarray):
+        if a.ndim == origin_ndim:
+            return scaler.inverse_transform(a)[:, 0]
+        if a.ndim == 2 and a.shape[1] == 1: #是二维数组，且第二个维度，即列维度为1
+            a = np.concatenate((a, np.zeros((a.shape[0], 2))), axis=1)  # 如果是一维数组，添加一个新的轴
+        elif a.shape[1] == 2:
+            a = np.concatenate((a, np.zeros((a.shape[0], 1))), axis=1)
+    a = scaler.inverse_transform(a)[:, 0]  # 反归一化
+    return a
+origin_ndim = 3
+
+pre_train = trans(pre_train,origin_ndim)
+pre_valid = trans(pre_valid,origin_ndim)
+pre_test = trans(pre_test,origin_ndim)
+
+outputT = trans(outputT,origin_ndim)
+outputV = trans(outputV,origin_ndim)
+outputTEST = trans(outputTEST,origin_ndim)
+
+# 计算评价指标
+results = {
+    "SWA-GRU Training": [assessment.RMSE(outputT, pre_train), assessment.MAE(outputT, pre_train), assessment.MAPE(outputT, pre_train), assessment.R2(outputT, pre_train)],
+    "SWA-GRU Validation": [assessment.RMSE(outputV, pre_valid), assessment.MAE(outputV, pre_valid), assessment.MAPE(outputV, pre_valid), assessment.R2(outputV, pre_valid)],
+    "SWA-GRU Test": [assessment.RMSE(outputTEST, pre_test), assessment.MAE(outputTEST, pre_test), assessment.MAPE(outputTEST, pre_test), assessment.R2(outputTEST, pre_test)],
+    }
+
+# 转换为DataFrame并转置
+df_results_swa = pd.DataFrame(results, index=["RMSE", "MAE", "MAPE", "R2"]).T
+# 打印表格
+print(df_results_swa)
+end = time.perf_counter()
+print("运行时间:", end - start)
+# print('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')
+# for i in range(len(pre_train)):
+#     print(pre_train[i])
+# print('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')
+# for i in range(len(pre_valid)):
+#     print(pre_valid[i])
+# print('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')
+for i in range(len(pre_test)):
+    print(pre_test[i])
+# plt.rcParams['font.family'] = 'SimHei'  # 防止图像中文乱码
+# validY_x = torch.arange(1, len(pre_test) + 1, 1)
+# plt.figure(dpi=500, figsize=(15, 5))
+# plt.plot(validY_x, outputTEST, color='b', label='测试集真实值')
+# plt.plot(validY_x, pre_test, color='g', label='测试集预测值')
+# plt.xlabel(u'时间')
+# plt.ylabel(u'负荷')
+# plt.legend()
+# plt.show()
+#
+# # 可视化训练和验证损失
+# plt.figure(dpi=700, figsize=(12, 8))
+# plt.plot([x for x in train_losses], label='Training Loss', linewidth=0.5)
+# plt.plot([x for x in valid_losses], label='Validation Loss', linewidth=0.5)
+# # plt.plot([x for x in swa_train_losses], label='swa_Training Loss', linewidth=0.5)
+# # plt.plot([x for x in swa_valid_losses], label='swa_Validation Loss', linewidth=0.5)
+# plt.xlabel('Epoch')
+# plt.ylabel('Loss')
+# plt.legend()
+# plt.title('Training and Validation Loss vs SWA Loss')
+# plt.show()
+#
